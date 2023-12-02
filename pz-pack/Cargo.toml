@@ -1,0 +1,10 @@
+[package]
+name = "pz-pack"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+byteorder = "1.5.0"
+defy = { git = "https://github.com/ScottyThePilot/misc-crates", version = "0.1.0" }
+image = { version = "0.24", default-features = false, features = ["png", "dds"] }
+thiserror = "1.0"

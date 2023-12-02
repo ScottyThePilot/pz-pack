@@ -1,0 +1,13 @@
+[package]
+name = "pz-pack-tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4.8", features = ["derive"] }
+defy = { git = "https://github.com/ScottyThePilot/misc-crates", version = "0.1.0" }
+glam = { version = "0.24", features = ["serde"] }
+pz-pack = { path = "../pz-pack" }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+toml = "0.8.8"

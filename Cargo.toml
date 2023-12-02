@@ -1,0 +1,5 @@
+[workspace]
+members = [
+  "pz-pack",
+  "pz-pack-tool"
+]
