@@ -24,7 +24,7 @@ extern crate toml;
 use clap::Parser;
 use defy::{ContextualError, Contextualize};
 use glam::UVec2;
-use pz_pack::{Pack, Page, Entry};
+use pz_pack::{Pack, Page, Entry, FormatVersion};
 use pz_pack::image::RgbaImage;
 use serde::{Deserialize, Serialize};
 
@@ -206,7 +206,7 @@ fn pack(in_path: PathBuf, out_path: PathBuf) -> Result<(), Error> {
     pages.push(page_config.into_page(name.clone(), image)?);
   };
 
-  let pack = Pack::new(pages);
+  let pack = Pack::new(FormatVersion::V1, pages);
   let writer = File::create(&out_path).map(BufWriter::new)
     .context_path("failed to create pack", &out_path)?;
   pack.write(writer).context_path("failed to write pack", &out_path)?;

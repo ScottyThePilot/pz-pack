@@ -27,6 +27,8 @@ use std::io::{self, Cursor, Read, Write};
 pub enum Error {
   #[error("unsupported image format {0:?}")]
   UnsupportedImageFormat(ImageFormat),
+  #[error("invalid format version {0:?}")]
+  InvalidFormatVersion(i32),
   #[error(transparent)]
   Io(#[from] ContextualError<io::Error>),
   #[error(transparent)]
@@ -114,7 +116,7 @@ impl Page {
     self.entries.get(index).map(|entry| entry.get_image(&self.image))
   }
 
-  fn read_v1<R: Read>(mut reader: R) -> Result<Self, Error> {
+  fn read_v0<R: Read>(mut reader: R) -> Result<Self, Error> {
     let name = read_string(&mut reader)
       .context("failed to read name for page")?;
     let entries_len = reader.read_u32::<LE>()
@@ -139,7 +141,7 @@ impl Page {
     })
   }
 
-  fn read_v2<R: Read>(mut reader: R) -> Result<Self, Error> {
+  fn read_v1<R: Read>(mut reader: R) -> Result<Self, Error> {
     let name = read_string(&mut reader)
       .context("failed to read name for page")?;
     let entries_len = reader.read_u32::<LE>()
@@ -164,7 +166,7 @@ impl Page {
     })
   }
 
-  fn write_v1<W: Write>(&self, mut writer: W) -> Result<(), Error> {
+  fn write_v0<W: Write>(&self, mut writer: W) -> Result<(), Error> {
     write_string(&mut writer, &self.name)
       .context("failed to write name for page")?;
     writer.write_u32::<LE>(self.entries.len() as u32)
@@ -183,7 +185,7 @@ impl Page {
     Ok(())
   }
 
-  fn write_v2<W: Write>(&self, mut writer: W) -> Result<(), Error> {
+  fn write_v1<W: Write>(&self, mut writer: W) -> Result<(), Error> {
     write_string(&mut writer, &self.name)
       .context("failed to write name for page")?;
     writer.write_u32::<LE>(self.entries.len() as u32)
@@ -207,18 +209,14 @@ impl Page {
 /// The full contents of a pack file.
 #[derive(Debug, Clone)]
 pub struct Pack {
-  /// On `V2` pack files, an extra number is provided before the pages count (similar to [`Page`]'s `mask`).
-  ///
-  /// I'm not sure what it is used for, so I am naming it `mask`.
-  pub mask: i32,
+  /// The format version of this pack file.
+  pub version: FormatVersion,
   pub pages: Vec<Page>
 }
 
 impl Pack {
-  pub const DEFAULT_MASK: i32 = 1;
-
-  pub fn new(pages: Vec<Page>) -> Self {
-    Pack { mask: Self::DEFAULT_MASK, pages }
+  pub fn new(version: FormatVersion, pages: Vec<Page>) -> Self {
+    Pack { version, pages }
   }
 
   pub fn read<R: Read>(mut reader: R) -> Result<Self, Error> {
@@ -226,11 +224,25 @@ impl Pack {
     reader.read_exact(&mut magic_bytes)
       .context("failed to read pack")?;
     if magic_bytes == MAGIC_BYTES {
-      Pack::read_v2(reader)
+      let version = reader.read_i32::<LE>()
+        .context("failed to read pack")?;
+      match FormatVersion::from_i32(version) {
+        // The version can't be 0, as that's reserved for the format that doesn't use the magic bytes
+        Some(FormatVersion::V0) | None => return Err(Error::InvalidFormatVersion(version)),
+        Some(FormatVersion::V1) => Pack::read_v1(reader)
+      }
     } else {
       let reader = Cursor::new(magic_bytes).chain(reader);
-      Pack::read_v1(reader)
+      Pack::read_v0(reader)
     }
+  }
+
+  fn read_v0<R: Read>(mut reader: R) -> Result<Self, Error> {
+    let pages_len = reader.read_u32::<LE>()
+      .context("failed to read pages_len for pack")?;
+    (0..pages_len).map(|_| Page::read_v0(&mut reader))
+      .collect::<Result<Vec<Page>, Error>>()
+      .map(|pages| Pack { version: FormatVersion::V0, pages })
   }
 
   fn read_v1<R: Read>(mut reader: R) -> Result<Self, Error> {
@@ -238,33 +250,35 @@ impl Pack {
       .context("failed to read pages_len for pack")?;
     (0..pages_len).map(|_| Page::read_v1(&mut reader))
       .collect::<Result<Vec<Page>, Error>>()
-      .map(|pages| Pack { mask: Self::DEFAULT_MASK, pages })
-  }
-
-  fn read_v2<R: Read>(mut reader: R) -> Result<Self, Error> {
-    let mask = reader.read_i32::<LE>()
-      .context("failed to read pack")?;
-    let pages_len = reader.read_u32::<LE>()
-      .context("failed to read pages_len for pack")?;
-    (0..pages_len).map(|_| Page::read_v2(&mut reader))
-      .collect::<Result<Vec<Page>, Error>>()
-      .map(|pages| Pack { mask, pages })
+      .map(|pages| Pack { version: FormatVersion::V1, pages })
   }
 
   #[inline]
   pub fn write<W: Write>(&self, writer: W) -> Result<(), Error> {
-    self.write_v2(writer)
-  }
-
-  #[inline]
-  pub fn write_with<W: Write>(&self, writer: W, version: FormatVersion) -> Result<(), Error> {
-    match version {
-      FormatVersion::V1 => self.write_v1(writer),
-      FormatVersion::V2 => self.write_v2(writer)
+    match self.version {
+      FormatVersion::V0 => self.write_v0(writer),
+      FormatVersion::V1 => self.write_v1(writer)
     }
   }
 
+  fn write_v0<W: Write>(&self, mut writer: W) -> Result<(), Error> {
+    writer.write_u32::<LE>(self.pages.len() as u32)
+      .context("failed to write pages_len for pack")?;
+    for page in self.pages.iter() {
+      page.write_v0(&mut writer)?;
+    };
+
+    writer.flush()
+      .context("failed to flush writer")?;
+
+    Ok(())
+  }
+
   fn write_v1<W: Write>(&self, mut writer: W) -> Result<(), Error> {
+    writer.write_all(&MAGIC_BYTES)
+      .context("failed to write pack")?;
+    writer.write_i32::<LE>(self.version.to_i32())
+      .context("failed to write pack")?;
     writer.write_u32::<LE>(self.pages.len() as u32)
       .context("failed to write pages_len for pack")?;
     for page in self.pages.iter() {
@@ -276,44 +290,44 @@ impl Pack {
 
     Ok(())
   }
-
-  fn write_v2<W: Write>(&self, mut writer: W) -> Result<(), Error> {
-    writer.write_all(&MAGIC_BYTES)
-      .context("failed to write pack")?;
-    writer.write_i32::<LE>(self.mask)
-      .context("failed to write pack")?;
-    writer.write_u32::<LE>(self.pages.len() as u32)
-      .context("failed to write pages_len for pack")?;
-    for page in self.pages.iter() {
-      page.write_v2(&mut writer)?;
-    };
-
-    writer.flush()
-      .context("failed to flush writer")?;
-
-    Ok(())
-  }
 }
 
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FormatVersion {
-  /// "V1" is a placeholder name for the format described in <https://pzwiki.net/wiki/File_formats>.
-  V1,
-  /// "V2" is a placeholder name for a similar format, that I have not been able to find described anywhere.
+  /// "V0" is a placeholder name for the format described in <https://pzwiki.net/wiki/File_formats>.
+  V0 = 0,
+  /// "V1" is a placeholder name for a similar format, that I have not been able to find described anywhere.
+  /// It's only evidenced in `zombie.fileSystem.TexturePackDevice`, and the fact that some of the texture packs
+  /// added in Build 42 use this format.
   ///
-  /// Other than a few differences, it is exactly the same as "V1":
+  /// Other than a few differences, it is exactly the same as "V0":
   /// - The file is prefixed with four bytes, `PZPK`.
-  /// - An `int32` of an unknown purpose comes before the `int32` marking the number of pages.
+  /// - An `int32` comes before the page count `int32` that indicates the format version, which is 1.
   /// - Images do not end with `0xDEADBEEF`, and instead have an `int32`/`uint32` prepended describing length in bytes.
   ///
-  /// Packs will be saved with "V2" by default.
-  V2
+  /// Packs will be saved with "V1" by default.
+  V1 = 1
+}
+
+impl FormatVersion {
+  pub fn from_i32(num: i32) -> Option<Self> {
+    match num {
+      0 => Some(FormatVersion::V0),
+      1 => Some(FormatVersion::V1),
+      _ => None
+    }
+  }
+
+  pub fn to_i32(self) -> i32 {
+    self as i32
+  }
 }
 
 impl Default for FormatVersion {
   #[inline]
   fn default() -> Self {
-    FormatVersion::V2
+    FormatVersion::V1
   }
 }
 
