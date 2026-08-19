@@ -10,264 +10,266 @@
   unreachable_pub
 )]
 
+extern crate anyhow;
 extern crate clap;
-extern crate defy;
+extern crate fs_err as fs;
 extern crate glam;
+extern crate indexmap;
 extern crate pz_pack;
 extern crate serde;
-#[macro_use]
-extern crate thiserror;
 extern crate toml;
 
 
 
+use anyhow::{Error, Context, bail};
 use clap::Parser;
-use defy::{ContextualError, Contextualize};
 use glam::UVec2;
 use pz_pack::{Pack, Page, Entry, FormatVersion};
 use pz_pack::image::RgbaImage;
 use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use indexmap::map::IndexMap;
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
-use std::io::{self, BufReader, BufWriter};
-use std::ffi::OsStr;
-use std::fs::File;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::io::{BufReader, BufWriter};
 
 
 
+fn main() {
+  Args::try_parse()
+    .and_then(|args| {
+      args.run().map_err(|error| {
+        use clap::error::{Error, ErrorKind};
+        Error::raw(ErrorKind::Io, format_args!("{error:?}"))
+      })
+    })
+    .unwrap_or_else(|error| {
+      error.print().expect("error");
+    });
+}
+
+/// Packs/unpacks Project Zomboid's texture pack files.
 #[derive(Debug, Parser)]
-#[command(name = "pz-pack")]
-#[command(author = "ScottyThePilot")]
-#[command(version = "0.1.0")]
-#[command(about = "Packs/unpacks Project Zomboid texturepack files", long_about = None)]
-enum Cli {
-  /// Packs a directory of .png and .toml files into a .pack file.
+#[command(version, author)]
+enum Args {
+  /// Packs the given directory into a .pack file.
+  #[command(name = "pack")]
   Pack {
     /// The path to the source directory to pack.
     #[arg(id = "in")]
     in_path: PathBuf,
     /// The path to the destination for the produced pack file to be placed.
     #[arg(id = "out")]
-    out_path: PathBuf
+    out_path: PathBuf,
+    /// Restricts the packed pages to only those listed.
+    #[arg(long)]
+    just: Vec<String>
   },
-  /// Unpacks a given .pack file into a directory.
+  /// Unpacks the given .pack file into a directory.
+  #[command(name = "unpack")]
   Unpack {
     /// The path to the pack file to unpack.
     #[arg(id = "in")]
     in_path: PathBuf,
     /// The path to the destination for the produced directory to be placed.
     #[arg(id = "out")]
-    out_path: PathBuf
-  },
-  /// Unpacks a given page from a given .pack file into a directory.
-  UnpackPage {
-    /// The path to the pack file to unpack.
-    #[arg(id = "in")]
-    in_path: PathBuf,
-    /// The path to the destination for the produced directory to be placed.
-    #[arg(id = "out")]
     out_path: PathBuf,
-    /// The page who's entries should be extracted.
-    #[arg(id = "page")]
-    page_name: String
+    /// Restricts the unpacked pages to only those listed.
+    #[arg(long)]
+    just: Vec<String>
   }
 }
 
-fn main() {
-  let result = match Cli::parse() {
-    Cli::Pack { in_path, out_path } => pack(in_path, out_path),
-    Cli::Unpack { in_path, out_path } => unpack(in_path, out_path),
-    Cli::UnpackPage { in_path, out_path, page_name } => unpack_page(in_path, out_path, page_name)
-  };
-
-  if let Err(error) = result {
-    eprintln!("{error}");
-  };
+impl Args {
+  fn run(self) -> Result<(), Error> {
+    match self {
+      Args::Pack { in_path, out_path, just } => pack(in_path, out_path, just),
+      Args::Unpack { in_path, out_path, just } => unpack(in_path, out_path, just)
+    }
+  }
 }
 
-#[derive(Debug, Error)]
-enum Error {
-  #[error("sub-image too small ({1} > {2}) for entry {0}")]
-  SubImageTooBig(String, UVec2, UVec2),
-  #[error("frame too small ({1} < {2}) for entry {0}")]
-  FrameTooSmall(String, UVec2, UVec2),
-  #[error("page {0:?} not found in pack")]
-  PageDoesNotExist(String),
-  #[error(transparent)]
-  Io(#[from] ContextualError<io::Error>),
-  #[error(transparent)]
-  Image(#[from] ContextualError<pz_pack::image::ImageError>),
-  #[error(transparent)]
-  TomlDe(#[from] ContextualError<toml::de::Error>),
-  #[error(transparent)]
-  TomlSer(#[from] ContextualError<toml::ser::Error>),
-  #[error(transparent)]
-  PackError(#[from] ContextualError<pz_pack::Error>)
-}
+fn unpack(in_path: PathBuf, out_path: PathBuf, just: Vec<String>) -> Result<(), Error> {
+  let just = just.into_iter().collect::<HashSet<String>>();
+  let pack_file = fs::File::open(&in_path)
+    .context("failed to open pack file")?;
+  let pack = Pack::read(BufReader::new(pack_file))
+    .context("failed to read pack file")?;
 
-fn unpack_page(in_path: PathBuf, out_path: PathBuf, page_name: String) -> Result<(), Error> {
-  let pack_file = File::open(&in_path).map(BufReader::new)
-    .context_path("failed to open pack file", &in_path)?;
-  let pack = Pack::read(pack_file)
-    .context_path("failed to read pack file", &in_path)?;
+  let (pack_definition, pages) = PackDefinition::from_pack(pack);
 
-  let mut dir_created = false;
-  let page = pack.pages.iter()
-    .find(|page| page.name == page_name)
-    .ok_or(Error::PageDoesNotExist(page_name))?;
-  for entry in page.entries.iter() {
-    if !dir_created {
-      std::fs::create_dir_all(&out_path)
-        .context_path("failed to create dir", &out_path)?;
-      dir_created = true;
+  fs::create_dir_all(&out_path).context("failed to create dir")?;
+  save_toml(out_path.join("pack.toml"), &pack_definition)?;
+
+  for (page_definition, image) in pages {
+    if just.is_empty() || just.contains(&page_definition.name) {
+      let out_path_page = out_path.join(normalize_name(&page_definition.name));
+      fs::create_dir_all(&out_path_page).context("failed to create dir")?;
+
+      save_toml(out_path_page.join("page.toml"), &page_definition)?;
+      save_png(out_path_page.join("page.png"), &image)?;
     };
-
-    let image = entry.get_image(&page.image);
-
-    let png_path = out_path.join(&format!("{}.png", entry.name));
-    let png_writer = File::create(&png_path).map(BufWriter::new)
-      .context_path("failed to create image", &png_path)?;
-    pz_pack::write_png(png_writer, &image)
-      .context_path("failed to write image", &png_path)?;
   };
 
   Ok(())
 }
 
-fn unpack(in_path: PathBuf, out_path: PathBuf) -> Result<(), Error> {
-  let pack_file = File::open(&in_path).map(BufReader::new)
-    .context_path("failed to open pack file", &in_path)?;
-  let pack = Pack::read(pack_file)
-    .context_path("failed to read pack file", &in_path)?;
-
-  let mut dir_created = false;
-  for page in pack.pages {
-    if !dir_created {
-      std::fs::create_dir_all(&out_path)
-        .context_path("failed to create dir", &out_path)?;
-      dir_created = true;
-    };
-
-    let (name, page_config, image) = PageConfig::from_page(page);
-    let toml_path = out_path.join(&format!("{name}.toml"));
-    let png_path = out_path.join(&format!("{name}.png"));
-
-    let toml_buf = toml::to_string_pretty(&page_config)
-      .context(format!("failed to serialize page {name}"))?;
-    std::fs::write(&toml_path, &toml_buf)
-      .context_path("failed to write page", &toml_path)?;
-
-    let png_writer = File::create(&png_path).map(BufWriter::new)
-      .context_path("failed to create image", &png_path)?;
-    pz_pack::write_png(png_writer, &image)
-      .context_path("failed to write image", &png_path)?;
-  };
-
-  Ok(())
-}
-
-fn pack(in_path: PathBuf, out_path: PathBuf) -> Result<(), Error> {
-  let mut toml_files = HashMap::new();
-  let mut png_files = HashMap::new();
-  for result in std::fs::read_dir(&in_path).context_path("failed to read dir", &in_path)? {
-    let entry = result.context_path("failed to read dir entry", &in_path)?;
-    let file_type = entry.file_type().context_path("failed to read dir entry file type", &in_path)?;
-    if !file_type.is_file() { continue };
-
-    let path = entry.path();
-    let stem = path.file_stem().and_then(OsStr::to_str);
-    let ext = path.extension().and_then(OsStr::to_str);
-    match Option::zip(stem, ext) {
-      Some((stem, ext)) if ext.eq_ignore_ascii_case("toml") => {
-        toml_files.insert(stem.to_owned(), path);
-      },
-      Some((stem, ext)) if ext.eq_ignore_ascii_case("png") => {
-        png_files.insert(stem.to_owned(), path);
-      },
-      _ => continue
-    };
-  };
-
+fn pack(in_path: PathBuf, out_path: PathBuf, just: Vec<String>) -> Result<(), Error> {
+  let just = just.into_iter().collect::<HashSet<String>>();
+  let pack_definition = load_toml::<PackDefinition>(in_path.join("pack.toml"))?;
   let mut pages = Vec::new();
-  for (name, toml_path) in toml_files.iter() {
-    let Some(png_path) = png_files.get(name) else { continue };
+  for result in fs::read_dir(&in_path).context("failed to read dir")? {
+    let entry = result.context("failed to read dir entry")?;
+    let file_type = entry.file_type().context("failed to read dir entry file type")?;
+    if !file_type.is_dir() { continue };
 
-    let toml_buf = std::fs::read_to_string(toml_path)
-      .context_path("failed to read file", toml_path)?;
-    let page_config = toml::from_str::<PageConfig>(&toml_buf)
-      .context_path("failed to read page config", toml_path)?;
+    let in_path_page = in_path.join(entry.file_name());
 
-    let png_reader = File::open(png_path).map(BufReader::new)
-      .context_path("failed to open image file", png_path)?;
-    let image = pz_pack::read_png(png_reader)
-      .context_path("failed to read image file", png_path)?;
+    let page_definition = load_toml::<PageDefinition>(in_path_page.join("page.toml"))?;
+    let image = load_png(in_path_page.join("page.png"))?;
 
-    pages.push(page_config.into_page(name.clone(), image)?);
+    if just.is_empty() || just.contains(&page_definition.name) {
+      pages.push((page_definition, image));
+    };
   };
 
-  let pack = Pack::new(FormatVersion::V1, pages);
-  let writer = File::create(&out_path).map(BufWriter::new)
-    .context_path("failed to create pack", &out_path)?;
-  pack.write(writer).context_path("failed to write pack", &out_path)?;
+  let pack = pack_definition.into_pack(pages)?;
 
+  let writer = fs::File::create(&out_path)
+    .context("failed to create pack")?;
+  pack.write(BufWriter::new(writer))
+    .context("failed to write pack")?;
+
+  Ok(())
+}
+
+fn load_png(path: impl Into<PathBuf>) -> Result<RgbaImage, Error> {
+  let image = pz_pack::read_png(fs::File::open(path)?)?;
+  Ok(image)
+}
+
+fn save_png(path: impl Into<PathBuf>, image: &RgbaImage) -> Result<(), Error> {
+  pz_pack::write_png(fs::File::create(path)?, image)?;
+  Ok(())
+}
+
+fn load_toml<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T, Error> {
+  let value = toml::from_str(&fs::read_to_string(path)?)?;
+  Ok(value)
+}
+
+fn save_toml<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), Error> {
+  fs::write(path, toml::ser::to_string_pretty(value)?)?;
   Ok(())
 }
 
 
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(transparent)]
-struct PageConfig {
-  entries: BTreeMap<String, EntryConfig>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+enum PackDefinitionVersion {
+  V0, V1
 }
 
-impl PageConfig {
-  fn from_page(page: Page) -> (String, Self, RgbaImage) {
+impl PackDefinitionVersion {
+  fn into_format_version(self) -> FormatVersion {
+    match self {
+      PackDefinitionVersion::V0 => FormatVersion::V0,
+      PackDefinitionVersion::V1 => FormatVersion::V1
+    }
+  }
+
+  fn from_format_version(format_version: FormatVersion) -> Self {
+    match format_version {
+      FormatVersion::V0 => PackDefinitionVersion::V0,
+      FormatVersion::V1 => PackDefinitionVersion::V1
+    }
+  }
+}
+
+impl Default for PackDefinitionVersion {
+  fn default() -> Self {
+    PackDefinitionVersion::V1
+  }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PackDefinition {
+  #[serde(default)]
+  version: PackDefinitionVersion
+}
+
+impl PackDefinition {
+  fn from_pack(pack: Pack) -> (Self, Vec<(PageDefinition, RgbaImage)>) {
+    let version = PackDefinitionVersion::from_format_version(pack.version);
+    (PackDefinition { version }, pack.pages.into_iter().map(PageDefinition::from_page).collect())
+  }
+
+  fn into_pack(self, pages: impl IntoIterator<Item = (PageDefinition, RgbaImage)>) -> Result<Pack, Error> {
+    let version = self.version.into_format_version();
+    let pages = pages.into_iter()
+      .map(|(page_definition, image)| page_definition.into_page(image))
+      .collect::<Result<Vec<Page>, Error>>()?;
+    Ok(Pack::new(version, pages))
+  }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PageDefinition {
+  name: String,
+  #[serde(default = "default_mask")]
+  mask: bool,
+  entries: IndexMap<String, EntryDefinition>
+}
+
+impl PageDefinition {
+  fn from_page(page: Page) -> (Self, RgbaImage) {
+    let name = page.name;
+    let mask = page.mask;
     let entries = page.entries.into_iter()
-      .map(|entry| EntryConfig::from_entry(entry))
+      .map(|entry| EntryDefinition::from_entry(entry))
       .collect();
-    (page.name, PageConfig { entries }, page.image)
+    (PageDefinition { name, mask, entries }, page.image)
   }
 
-  fn into_page(self, name: String, image: RgbaImage) -> Result<Page, Error> {
+  fn into_page(self, image: RgbaImage) -> Result<Page, Error> {
     let entries = self.entries.into_iter()
-      .map(|(name, entry_config)| entry_config.into_entry(name, &image))
+      .map(|(name, entry_definition)| entry_definition.into_entry(name, &image))
       .collect::<Result<Vec<Entry>, Error>>()?;
-    Ok(Page::new(name, entries, image))
+    Ok(Page::with_mask(self.name, self.mask, entries, image))
   }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct EntryConfig {
+struct EntryDefinition {
   pos: UVec2,
   size: UVec2,
   #[serde(flatten)]
-  frame: Option<EntryConfigFrame>
+  frame: Option<EntryFrameDefinition>
 }
 
-impl EntryConfig {
+impl EntryDefinition {
   fn from_entry(entry: Entry) -> (String, Self) {
     let name = entry.name;
     let pos = UVec2::new(entry.x_pos, entry.y_pos);
     let size = UVec2::new(entry.width, entry.height);
     let frame_offset = UVec2::new(entry.x_offset, entry.y_offset);
     let frame_size = UVec2::new(entry.total_width, entry.total_height);
-    let frame = (frame_offset != pos && frame_size != size)
-      .then_some(EntryConfigFrame { offset: frame_offset, size: frame_size });
-    (name, EntryConfig { pos, size, frame })
+    let frame = (frame_offset != UVec2::ZERO && frame_size != size)
+      .then_some(EntryFrameDefinition { offset: frame_offset, size: frame_size });
+    (name, EntryDefinition { pos, size, frame })
   }
 
   fn into_entry(self, name: String, image: &RgbaImage) -> Result<Entry, Error> {
     let image_size = UVec2::from(image.dimensions());
-    let frame = self.frame.unwrap_or(EntryConfigFrame { offset: UVec2::ZERO, size: self.size });
+    let frame = self.frame.unwrap_or(EntryFrameDefinition { offset: UVec2::ZERO, size: self.size });
 
     if self.size == UVec2::ZERO || image_size.cmplt(self.pos + self.size).any() {
-      return Err(Error::SubImageTooBig(name, self.size, image_size));
+      bail!("sub-image too small ({1} > {2}) for entry {0}", name, self.size, image_size);
     };
 
     if frame.size == UVec2::ZERO || self.size.cmpgt(frame.offset + frame.size).any() {
-      return Err(Error::FrameTooSmall(name, frame.size, self.size))
+      bail!("frame too small ({1} < {2}) for entry {0}", name, frame.size, self.size);
     };
 
     Ok(Entry {
@@ -285,9 +287,26 @@ impl EntryConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct EntryConfigFrame {
+struct EntryFrameDefinition {
   #[serde(rename = "frame_offset")]
   offset: UVec2,
   #[serde(rename = "frame_size")]
   size: UVec2
+}
+
+fn default_mask() -> bool {
+  true
+}
+
+
+
+fn normalize_name(name: &str) -> String {
+  name.chars()
+    .filter_map(|ch| match ch {
+      ch if ch.is_ascii_control() => None,
+      '<' | '>' | ':' | '"' | '|' | '?' | '*' => None,
+      '/' | '\\' | '.' => Some('_'),
+      ch => Some(ch)
+    })
+    .collect::<String>()
 }

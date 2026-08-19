@@ -100,7 +100,7 @@ impl Entry {
 #[derive(Debug, Clone)]
 pub struct Page {
   pub name: String,
-  pub mask: i32,
+  pub mask: bool,
   pub entries: Vec<Entry>,
   pub image: RgbaImage
 }
@@ -109,7 +109,11 @@ impl Page {
   pub const DEFAULT_MASK: i32 = 1;
 
   pub fn new(name: String, entries: Vec<Entry>, image: RgbaImage) -> Self {
-    Page { name, mask: Self::DEFAULT_MASK, entries, image }
+    Page { name, mask: true, entries, image }
+  }
+
+  pub fn with_mask(name: String, mask: bool, entries: Vec<Entry>, image: RgbaImage) -> Self {
+    Page { name, mask, entries, image }
   }
 
   pub fn get_entry_image(&self, index: usize) -> Option<RgbaImage> {
@@ -135,7 +139,7 @@ impl Page {
 
     Ok(Page {
       name,
-      mask,
+      mask: mask != 0,
       entries,
       image
     })
@@ -160,7 +164,7 @@ impl Page {
 
     Ok(Page {
       name,
-      mask,
+      mask: mask != 0,
       entries,
       image
     })
@@ -171,7 +175,7 @@ impl Page {
       .context("failed to write name for page")?;
     writer.write_u32::<LE>(self.entries.len() as u32)
       .context("failed to write entries_len for page")?;
-    writer.write_i32::<LE>(self.mask)
+    writer.write_i32::<LE>(self.mask as i32)
       .context("failed to write mask for page")?;
     for entry in self.entries.iter() {
       entry.write(&mut writer)?;
@@ -190,7 +194,7 @@ impl Page {
       .context("failed to write name for page")?;
     writer.write_u32::<LE>(self.entries.len() as u32)
       .context("failed to write entries_len for page")?;
-    writer.write_i32::<LE>(self.mask)
+    writer.write_i32::<LE>(self.mask as i32)
       .context("failed to write mask for page")?;
     for entry in self.entries.iter() {
       entry.write(&mut writer)?;

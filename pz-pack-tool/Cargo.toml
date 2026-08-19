@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-clap = { version = "4.4.8", features = ["derive"] }
-defy = { git = "https://github.com/ScottyThePilot/misc-crates", version = "0.1.0" }
-glam = { version = "0.24", features = ["serde"] }
+anyhow = { version = "1.0" }
+clap = { version = "4.6.6", features = ["derive"] }
+fs-err = { version = "3.3.1" }
+glam = { version = "0.33.3", features = ["serde"] }
+indexmap = { version = "2.14.0", features = ["serde"] }
 pz-pack = { path = "../pz-pack" }
 serde = { version = "1.0", features = ["derive"] }
-thiserror = "1.0"
-toml = "0.8.8"
+toml = { version = "1.1.4" }
